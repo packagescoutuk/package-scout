@@ -8,7 +8,6 @@ import py7zr
 import time
 import threading
 import sqlite3
-from pathlib import Path
 import hashlib
 import re
 import unicodedata
@@ -16,17 +15,16 @@ import json
 from collections import deque
 from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
+import zipfile
 
 # TODO: TELEGRAM NOTIFICATION IF UNMATCHABLE REGIONS FOR MANUAL FIX
-# TODO: ADD 'alias' INTO THE DB SO THAT MANUAL AMENDMENTS ARE STICKY & CAN BE REFERENCED ACROSS DATA
 
 # PATHS
 BASE_DIR = Path(__file__).resolve().parent
 HOLIDAYS_DB_PATH = BASE_DIR / "holidays.db"
-# db = sqlite3.connect(HOLIDAYS_DB_PATH); db.execute("DROP TABLE IF EXISTS regions"); db.commit(); db.close()
-show_debug_map = True
 
-import zipfile
+db = sqlite3.connect(HOLIDAYS_DB_PATH); db.execute("DROP TABLE IF EXISTS regions"); db.commit(); db.close()
+
 # PREPARE GNS + GNIS + US CENSUS SOURCE DATA | GNS FILE AGE ALONE CONTROLS FULL REFRESH
 GEO_DIR = BASE_DIR / "GEO"
 GNS_EXPIRY_DAYS = 14
@@ -66,7 +64,6 @@ def prepare_geographic_source_data():
         except OSError:
             return False
 
-    # > discover newest Census Gazetteer year that actually contains the national states archive
     def latest_census_states_source():
         try:
             response = requests.get(CENSUS_GAZETTEER_BASE_URL, timeout=30)
@@ -92,7 +89,6 @@ def prepare_geographic_source_data():
 
     CENSUS_STATES_SOURCE_YEAR, CENSUS_STATES_URL = latest_census_states_source()
 
-    # > latest valid downloaded GNS file is authoritative refresh clock
     gns_files = []
     for path in GEO_DIR.glob("Whole_World_*.txt"):
         try:
@@ -122,12 +118,9 @@ def prepare_geographic_source_data():
     gnis_path = GEO_DIR / f"DomesticNames_National_{stamp}.txt"
     census_states_path = GEO_DIR / f"Census_States_{CENSUS_STATES_SOURCE_YEAR}_{stamp}.txt"
 
-    if not full_refresh:
-        print(f"GNS                | CACHED | {source_date} | AGE {gns_age} DAYS")
-    else:
-        print(f"GNS                | {'MISSING/INVALID' if gns_path is None else 'EXPIRED'} | FULL REFRESH")
+    if not full_refresh: print(f"GNS                | CACHED | {source_date} | AGE {gns_age} DAYS")
+    else: print(f"GNS                | {'MISSING/INVALID' if gns_path is None else 'EXPIRED'} | FULL REFRESH")
 
-    # > common streamed requests download
     def download_requests(url, path, label):
         temp_path = path.with_suffix(path.suffix + ".download")
         temp_path.unlink(missing_ok=True)
@@ -152,13 +145,9 @@ def prepare_geographic_source_data():
         temp_path.replace(path)
         print()
 
-    # > countryInfo refreshes with GNS, or repairs itself if missing
-    if full_refresh or not country_path.exists():
-        download_requests(COUNTRY_INFO_URL, country_path, "countryInfo.txt")
-    else:
-        print(f"COUNTRY INFO       | CACHED | {country_path.name}")
+    if full_refresh or not country_path.exists(): download_requests(COUNTRY_INFO_URL, country_path, "countryInfo.txt")
+    else: print(f"COUNTRY INFO       | CACHED | {country_path.name}")
 
-    # > GNS only downloads when its own source is missing, invalid or expired
     if full_refresh:
         gns_path = GEO_DIR / f"Whole_World_{stamp}.txt"
         gns_archive = GEO_DIR / "Whole_World.7z"
@@ -244,7 +233,6 @@ def prepare_geographic_source_data():
         gns_archive.unlink(missing_ok=True)
         shutil.rmtree(gns_extract_dir, ignore_errors=True)
 
-    # > GNIS refreshes with GNS, or repairs itself independently if missing/invalid
     gnis_valid = valid_gnis(gnis_path)
 
     if full_refresh or not gnis_valid:
@@ -298,7 +286,6 @@ def prepare_geographic_source_data():
     else:
         print(f"GNIS               | CACHED | {gnis_path.name}")
 
-    # > Census states independently tracks the newest Gazetteer year that actually publishes a states archive
     census_states_valid = valid_census_states(census_states_path)
 
     if full_refresh or not census_states_valid:
@@ -349,13 +336,11 @@ def prepare_geographic_source_data():
         census_archive.unlink(missing_ok=True)
         shutil.rmtree(census_extract_dir, ignore_errors=True)
 
-        # > retain only the newest Census states source after a successful version change/repair
         for path in GEO_DIR.glob("Census_States_*.txt"):
             if path != census_states_path: path.unlink()
     else:
         print(f"CENSUS STATES      | CACHED | {census_states_path.name}")
 
-    # > after successful full refresh retain only newest synchronized set
     if full_refresh:
         for path in GEO_DIR.glob("countryInfo_*.txt"):
             if path != country_path: path.unlink()
@@ -380,6 +365,7 @@ def prepare_geographic_source_data():
 
     return country_path, gns_path, gnis_path, census_states_path, full_refresh
 COUNTRY_INFO_PATH, GNS_WORLD_PATH, GNIS_DOMESTIC_PATH, CENSUS_STATES_PATH, GEO_DATA_REFRESHED = prepare_geographic_source_data()
+
 # SYNC DISTINCT DEAL REGIONS INTO REGIONS TABLE
 def sync_regions():
     db = sqlite3.connect(HOLIDAYS_DB_PATH)
@@ -397,7 +383,6 @@ def sync_regions():
         )
     """)
 
-    # > migrate existing regions table without losing stored coordinates
     existing_columns = {row[1] for row in db.execute("PRAGMA table_info(regions)").fetchall()}
     for column in ("coordinate_match", "coordinate_feature", "coordinate_confidence"):
         if column not in existing_columns: db.execute(f"ALTER TABLE regions ADD COLUMN {column} TEXT")
@@ -417,10 +402,11 @@ def sync_regions():
     return after, after - before
 REGION_COUNT, NEW_REGIONS = sync_regions()
 
-# BUILD REUSABLE GNS INDEX + MATCH ALL NON-US REGIONS | INDEX REBUILDS ONLY WHEN GNS SOURCE CHANGES
+# BUILD REUSABLE GNS INDEX + SIMPLE EXACT/CLEAN/ALIAS REGION ANCHOR MATCHING
 GNS_INDEX_DB_PATH = GEO_DIR / "gns_index.db"
 GNS_INDEX_VERSION = "1"
-GNS_REGION_CLUSTER_KM = 50.0
+GNS_AMBIGUITY_KM = 10.0
+GNS_ISLAND_ADMIN_MAX_KM = 50.0
 GNS_REGION_FEATURES = {
     "PCLI", "PCLIX", "ADM1", "ADM2", "ADMD", "RGN",
     "ISL", "ISLET", "ISLS", "PEN", "CAPE", "CST", "LK",
@@ -436,7 +422,6 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
     clean = lambda v: re.sub(r"\([^)]*\)", "", str(v or "")).strip(" ,-")
     is_us = lambda country: norm(country) in US_COUNTRY_NAMES
 
-    # > explicit supplier tourism/transliteration aliases; used only when exact/clean finds nothing
     region_aliases = {
         ("greece", "halkidiki"): ["Chalkidiki"],
         ("greece", "kefalonia"): ["Cephalonia", "Kefallinia"],
@@ -448,7 +433,6 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
         ("spain", "costa de almeria"): ["Almería"]
     }
 
-    # > supplier-name variants only; no fuzzy guessing
     def region_variants(region):
         original = clean(region)
         variants = [(original, "EXACT")]
@@ -457,6 +441,10 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
         if simplified and norm(simplified) != norm(original): variants.append((simplified, "CLEAN"))
         return variants
 
+    def is_area_region(region):
+        value = clean(region)
+        return bool(re.search(r"(?:\s+area|\s*(?:&|and)\s+surrounding\s+area)\s*$", value, flags=re.I))
+
     def haversine_km(lat1, lon1, lat2, lon2):
         r = 6371.0088
         p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -464,126 +452,119 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
         a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
         return 2 * r * math.asin(min(1.0, math.sqrt(a)))
 
-    def cluster_candidates(candidates):
-        groups = []
-        for candidate in candidates:
-            touching = []
-            for i, group in enumerate(groups):
-                if any(haversine_km(candidate["latitude"], candidate["longitude"], other["latitude"], other["longitude"]) <= GNS_REGION_CLUSTER_KM for other in group): touching.append(i)
-            if not touching:
-                groups.append([candidate])
-                continue
-            merged = [candidate]
-            for i in reversed(touching): merged.extend(groups.pop(i))
-            groups.append(merged)
+    def candidate_has_feature(candidate, values):
+        features = {x.strip().upper() for x in str(candidate.get("feature") or "").split(",") if x.strip()}
+        return bool(features.intersection(values))
 
-        changed = True
-        while changed and len(groups) > 1:
-            changed = False
-            for i in range(len(groups)):
-                if changed: break
-                for j in range(i + 1, len(groups)):
-                    if any(haversine_km(a["latitude"], a["longitude"], b["latitude"], b["longitude"]) <= GNS_REGION_CLUSTER_KM for a in groups[i] for b in groups[j]):
-                        groups[i].extend(groups[j])
-                        del groups[j]
-                        changed = True
-                        break
-        return groups
+    def should_prefer_island(country, region, candidates):
+        if norm(region) == norm(country) or is_area_region(region): return False
 
-    def feature_priority(country, region, feature):
-        region_norm = norm(region)
-        country_norm = norm(country)
-        features = [x.strip().upper() for x in str(feature or "").split(",") if x.strip()]
+        islands = [x for x in candidates if candidate_has_feature(x, {"ISL", "ISLS", "ISLET"})]
+        if not islands: return False
 
-        def one(value):
-            if value not in GNS_REGION_FEATURES: return 99
+        admins = [x for x in candidates if candidate_has_feature(x, {"ADM1"})]
+        if not admins: return True
 
-            # > Abu Dhabi supplier region means the Emirate, not Abu Dhabi Island
-            if country_norm == "united arab emirates" and region_norm == "abu dhabi":
-                if value == "ADM1": return 0
-                if value in {"ADM2", "ADMD", "RGN"}: return 1
-                if value in {"PPLC", "PPLCD", "PPLA", "PPLA2", "PPLA3", "PPLA4"}: return 2
-                if value in {"ISL", "ISLS", "PEN"}: return 4
-                if value in {"PPL", "PPLL", "PPLX", "RSRT"}: return 5
-                return 8
+        return min(
+            haversine_km(island["latitude"], island["longitude"], admin["latitude"], admin["longitude"])
+            for island in islands for admin in admins
+        ) <= GNS_ISLAND_ADMIN_MAX_KM
 
-            if region_norm == country_norm:
-                if value in {"PCLI", "PCLIX"}: return 0
-                if value in {"ISL", "ISLS", "PEN"}: return 1
-                if value == "ADM1": return 2
-                if value in {"ADM2", "ADMD", "RGN"}: return 3
-                if value in {"PPLC", "PPLCD"}: return 4
-                return 8
+    def feature_priority(country, region, feature, prefer_island=False):
+        features = {x.strip().upper() for x in str(feature or "").split(",") if x.strip()}
 
-            if any(word in region_norm for word in ("coast", "costa", "riviera")):
-                if value == "CST": return 0
-                if value in {"ADM1", "ADM2", "ADMD", "RGN"}: return 1
-                if value in {"ISL", "ISLS", "PEN", "CAPE", "BAY", "BAYS", "BCH"}: return 2
-                if value in {"PPLC", "PPLA", "PPLA2", "PPLA3", "PPLA4", "PPL", "PPLL", "PPLX", "RSRT"}: return 4
-                return 8
+        if norm(region) == norm(country):
+            priorities = [
+                {"PCLI", "PCLIX"},
+                {"ISL", "ISLS", "ISLET"},
+                {"ADM1"},
+                {"PPLC", "PPLCD"},
+                {"ADM2", "ADMD", "RGN"},
+                {"PPLA", "PPLA2", "PPLA3", "PPLA4"},
+                {"PPL", "PPLL", "PPLX"},
+                {"RSRT"},
+                {"PEN", "CST", "CAPE", "BAY", "BAYS", "LK", "BCH"}
+            ]
+        elif is_area_region(region):
+            priorities = [
+                {"ADM1"},
+                {"ADM2", "ADMD", "RGN"},
+                {"ISL", "ISLS", "ISLET"},
+                {"PPLC", "PPLCD", "PPLA", "PPLA2", "PPLA3", "PPLA4"},
+                {"PPL", "PPLL", "PPLX"},
+                {"RSRT"},
+                {"PEN", "CST", "CAPE", "BAY", "BAYS", "LK", "BCH"},
+                {"PCLI", "PCLIX"}
+            ]
+        elif prefer_island:
+            priorities = [
+                {"ISL", "ISLS", "ISLET"},
+                {"PPLC", "PPLCD", "PPLA", "PPLA2", "PPLA3", "PPLA4"},
+                {"ADM1"},
+                {"ADM2", "ADMD", "RGN"},
+                {"PPL", "PPLL", "PPLX"},
+                {"RSRT"},
+                {"PEN", "CST", "CAPE", "BAY", "BAYS", "LK", "BCH"},
+                {"PCLI", "PCLIX"}
+            ]
+        else:
+            priorities = [
+                {"PPLC", "PPLCD", "PPLA", "PPLA2", "PPLA3", "PPLA4"},
+                {"ADM1"},
+                {"ISL", "ISLS", "ISLET"},
+                {"ADM2", "ADMD", "RGN"},
+                {"PPL", "PPLL", "PPLX"},
+                {"RSRT"},
+                {"PEN", "CST", "CAPE", "BAY", "BAYS", "LK", "BCH"},
+                {"PCLI", "PCLIX"}
+            ]
 
-            if "lake" in region_norm:
-                if value == "LK": return 0
-                if value in {"ADM1", "ADM2", "ADMD", "RGN"}: return 2
-                if value in {"PPLC", "PPLA", "PPLA2", "PPLA3", "PPLA4", "PPL"}: return 4
-                return 8
-
-            if value in {"ISL", "ISLS"}: return 0
-            if value == "ADM1": return 1
-            if value in {"ADM2", "ADMD", "RGN"}: return 2
-            if value in {"PPLC", "PPLCD", "PPLA", "PPLA2", "PPLA3", "PPLA4"}: return 3
-            if value in {"PEN", "CST", "CAPE", "BAY", "BAYS", "LK", "BCH"}: return 4
-            if value in {"PPL", "PPLL", "PPLX", "RSRT"}: return 5
-            return 8
-
-        return min((one(value) for value in features), default=99)
+        for priority, allowed in enumerate(priorities):
+            if features.intersection(allowed): return priority
+        return 99
 
     def select_candidate(country, region, candidates):
-        credible = []
-        for candidate in candidates:
-            candidate["_priority"] = feature_priority(country, region, candidate["feature"])
-            candidate["_credible"] = candidate["_priority"] < 99
-            if candidate["_credible"]: credible.append(candidate)
+        if not candidates: return None, "NO MATCH"
 
+        mode_priority = {"EXACT":0, "CLEAN":1, "ALIAS":2}
+        best_match_mode = min(mode_priority.get(candidate["match_mode"], 99) for candidate in candidates)
+        mode_candidates = [candidate for candidate in candidates if mode_priority.get(candidate["match_mode"], 99) == best_match_mode]
+        prefer_island = should_prefer_island(country, region, mode_candidates)
+
+        for candidate in candidates:
+            candidate["_prefer_island"] = prefer_island
+            candidate["_priority"] = feature_priority(country, region, candidate["feature"], prefer_island)
+            candidate["_credible"] = candidate["_priority"] < 99
+
+        credible = [candidate for candidate in candidates if candidate["_credible"] and mode_priority.get(candidate["match_mode"], 99) == best_match_mode]
         if not credible: return None, "NO CREDIBLE"
 
-        best_priority = min(x["_priority"] for x in credible)
-        top = [x for x in credible if x["_priority"] == best_priority]
-        groups = cluster_candidates(top)
+        best_priority = min(candidate["_priority"] for candidate in credible)
+        top = [candidate for candidate in credible if candidate["_priority"] == best_priority]
+        top.sort(key=lambda candidate: (int(candidate.get("rank") or 999), candidate["name"], candidate["latitude"], candidate["longitude"]))
 
-        if len(groups) > 1: return None, f"AMBIGUOUS {len(groups)} CLUSTERS"
+        selected = top[0]
 
-        group = groups[0]
-        mode_priority = {"EXACT":0, "CLEAN":1, "ALIAS":2}
+        materially_different = [
+            candidate for candidate in top[1:]
+            if haversine_km(selected["latitude"], selected["longitude"], candidate["latitude"], candidate["longitude"]) > GNS_AMBIGUITY_KM
+        ]
 
-        if len(group) == 1: return group[0], group[0]["match_mode"]
+        if materially_different: return None, f"AMBIGUOUS {len(top)} SAME-PRIORITY LOCATIONS"
 
-        def centrality(candidate):
-            return sum(haversine_km(candidate["latitude"], candidate["longitude"], other["latitude"], other["longitude"]) for other in group if other is not candidate)
+        return selected, selected["match_mode"]
 
-        selected = min(group, key=lambda x: (mode_priority.get(x["match_mode"], 99), int(x.get("rank") or 999), centrality(x), x["name"]))
-        return selected, "CLUSTER"
-
-    # > classify provenance without making matching stricter
-    def coordinate_confidence(country, region, selected, selection_reason=None):
-        region_norm = norm(region)
-        country_norm = norm(country)
+    def coordinate_confidence(country, region, selected):
         match_mode = selected["match_mode"]
         features = {x.strip().upper() for x in str(selected.get("feature") or "").split(",") if x.strip()}
 
-        if match_mode == "ALIAS": return "REVIEW"
-        if country_norm == "united arab emirates" and region_norm == "abu dhabi": return "REVIEW"
-        if any(word in region_norm for word in ("coast", "costa", "riviera")) or "lake" in region_norm: return "REVIEW"
-        if features.intersection({"PEN", "CST", "CAPE", "BAY", "BAYS", "LK", "BCH"}): return "REVIEW"
-        if selection_reason and str(selection_reason).startswith("AMBIGUOUS"): return "REVIEW"
+        if match_mode == "ALIAS": return "HIGH"
         if match_mode == "CLEAN": return "HIGH"
-        if region_norm == country_norm and features.intersection({"PCLI", "PCLIX"}): return "TRUSTED"
-        if features.intersection({"ISL", "ISLS"}): return "TRUSTED"
+        if norm(region) == norm(country) and features.intersection({"PCLI", "PCLIX"}): return "TRUSTED"
+        if features.intersection({"ISL", "ISLS", "ISLET"}): return "TRUSTED"
         if "ADM1" in features: return "TRUSTED"
-        if match_mode == "EXACT": return "HIGH"
-        return "REVIEW"
+        return "HIGH"
 
-    # > country names -> GNS country codes
     country_codes = {}
     with open(COUNTRY_INFO_PATH, "r", encoding="utf-8-sig", errors="replace") as f:
         for raw in f:
@@ -612,7 +593,6 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
         for name in names: codes.update(country_codes.get(norm(name), set()))
         return codes
 
-    # > reusable index contains the full useful GNS source and is never tied to current/missing regions
     source_signature = f"{GNS_WORLD_PATH.name}|{GNS_WORLD_PATH.stat().st_size}"
     index_valid = False
 
@@ -736,7 +716,6 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
         index_db.close()
         print(f"GNS INDEX          | READY | {inserted:,} NAME ROWS")
 
-    # > all non-US regions exist independently of matching; missing coordinates are matched and existing GNS rows missing provenance are classified without moving them
     db = sqlite3.connect(HOLIDAYS_DB_PATH)
     all_region_rows = db.execute("""
         SELECT country,region,latitude,longitude,coordinate_source,coordinate_match,coordinate_feature,coordinate_confidence
@@ -759,11 +738,12 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
             )
         )
     ]
+
     to_match = sum(1 for country, region, latitude, longitude, source, match, feature, confidence in gns_regions if latitude is None or longitude is None)
     to_classify = len(gns_regions) - to_match
     index_db = sqlite3.connect(GNS_INDEX_DB_PATH)
 
-    stats = {"total":len(gns_regions), "resolved":0, "classified":0, "exact":0, "clean":0, "alias":0, "cluster":0, "ambiguous":0, "no_match":0, "no_country":0, "metadata_failed":0}
+    stats = {"total":len(gns_regions), "resolved":0, "classified":0, "exact":0, "clean":0, "alias":0, "ambiguous":0, "no_match":0, "no_country":0, "metadata_failed":0}
 
     print(f"GNS REGIONS        | {len(all_gns_regions):,} TOTAL | {already_resolved:,} HAVE COORDS | {to_match:,} TO MATCH | {to_classify:,} TO CLASSIFY")
 
@@ -775,12 +755,13 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
 
     for index, (country, region, existing_latitude, existing_longitude, existing_source, existing_match, existing_feature, existing_confidence) in enumerate(gns_regions, 1):
         codes = codes_for_country(country)
-        candidates_by_key = {}
         candidates = []
         classification_only = existing_latitude is not None and existing_longitude is not None and str(existing_source or "").upper() == "GNS"
 
         def lookup_variants(variants):
             found = {}
+            mode_priority = {"EXACT":0, "CLEAN":1, "ALIAS":2}
+
             for variant, match_mode in variants:
                 variant_norm = norm(variant)
                 variant_compact = compact(variant)
@@ -810,24 +791,21 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
                             "rank":int(rank or 999),
                             "match_mode":match_mode
                         }
+
                         old = found.get(key)
-                        mode_priority = {"EXACT":0, "CLEAN":1, "ALIAS":2}
                         if old is None or (mode_priority.get(match_mode, 99), candidate["rank"]) < (mode_priority.get(old["match_mode"], 99), old["rank"]): found[key] = candidate
-            return found
+
+            return list(found.values())
 
         if not codes:
             selected, reason = None, "NO COUNTRY CODE"
             stats["no_country"] += 1
         else:
-            # > normal exact/clean matching always gets first opportunity
-            candidates_by_key = lookup_variants(region_variants(region))
+            candidates = lookup_variants(region_variants(region))
 
-            # > explicit aliases are only consulted when normal matching found nothing
-            if not candidates_by_key:
+            if not candidates:
                 aliases = region_aliases.get((norm(country), norm(region)), [])
-                if aliases: candidates_by_key = lookup_variants([(alias, "ALIAS") for alias in aliases])
-
-            candidates = list(candidates_by_key.values())
+                if aliases: candidates = lookup_variants([(alias, "ALIAS") for alias in aliases])
 
             if not candidates:
                 selected, reason = None, "NO MATCH"
@@ -842,25 +820,30 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
                         if abs(candidate["latitude"] - float(existing_latitude)) <= 0.00001
                         and abs(candidate["longitude"] - float(existing_longitude)) <= 0.00001
                     ]
+
                     if existing_candidates:
                         mode_priority = {"EXACT":0, "CLEAN":1, "ALIAS":2}
-                        selected = min(existing_candidates, key=lambda x: (mode_priority.get(x["match_mode"], 99), x["rank"], x["name"]))
+                        prefer_island = should_prefer_island(country, region, candidates)
+                        selected = min(existing_candidates, key=lambda candidate: (mode_priority.get(candidate["match_mode"], 99), feature_priority(country, region, candidate["feature"], prefer_island), candidate["rank"], candidate["name"]))
+                        selected["_priority"] = feature_priority(country, region, selected["feature"], prefer_island)
+                        selected["_credible"] = selected["_priority"] < 99
+                        selected["_prefer_island"] = prefer_island
                         reason = selection_reason
                     else:
                         selected, reason = None, "EXISTING COORD NOT FOUND"
                         stats["metadata_failed"] += 1
                 else:
                     selected, reason = proposed, selection_reason
+
                     if selected:
                         stats["resolved"] += 1
-                        if reason == "CLUSTER": stats["cluster"] += 1
                     elif reason.startswith("AMBIGUOUS"):
                         stats["ambiguous"] += 1
                     else:
                         stats["no_match"] += 1
 
         if selected:
-            confidence = coordinate_confidence(country, region, selected, reason)
+            confidence = coordinate_confidence(country, region, selected)
 
             if classification_only:
                 db.execute("""
@@ -880,7 +863,7 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
                       AND (latitude IS NULL OR longitude IS NULL)
                       AND UPPER(COALESCE(coordinate_source,'')) <> 'MANUAL'
                 """, (selected["latitude"], selected["longitude"], selected["match_mode"], selected["feature"], confidence, country, region))
-                status = "AUTO CLUSTER" if reason == "CLUSTER" else f"AUTO {selected['match_mode']}"
+                status = f"AUTO {selected['match_mode']}"
 
             if selected["match_mode"] == "EXACT": stats["exact"] += 1
             elif selected["match_mode"] == "CLEAN": stats["clean"] += 1
@@ -897,11 +880,13 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
             print(f"STATUS             | {status} | CANDIDATES:{len(candidates)} | CREDIBLE:{credible_count}")
 
             if selected:
-                print(f"SELECTED           | {selected['latitude']:>10.6f},{selected['longitude']:>11.6f} | TYPE:{selected['feature']:<8} | MATCH:{selected['match_mode']:<5} | CONF:{confidence:<7} | NAME:{selected['name']} | ADM1:{selected['adm1'] or '-'} | RANK:{selected['rank']}")
+                semantic = "AREA" if is_area_region(region) else "ISLAND" if selected.get("_prefer_island") else "PLAIN"
+                print(f"SELECTED           | {selected['latitude']:>10.6f},{selected['longitude']:>11.6f} | TYPE:{selected['feature']:<8} | MATCH:{selected['match_mode']:<5} | CONF:{confidence:<7} | MODE:{semantic:<6} | NAME:{selected['name']} | ADM1:{selected['adm1'] or '-'} | RANK:{selected['rank']}")
             else:
                 print("SELECTED           | NONE")
 
-            for candidate_index, candidate in enumerate(sorted(candidates, key=lambda x: (x.get("_priority", 99), {"EXACT":0, "CLEAN":1, "ALIAS":2}.get(x["match_mode"], 99), x["rank"], x["name"])), 1):
+            mode_priority = {"EXACT":0, "CLEAN":1, "ALIAS":2}
+            for candidate_index, candidate in enumerate(sorted(candidates, key=lambda candidate: (mode_priority.get(candidate["match_mode"], 99), candidate.get("_priority", 99), candidate["rank"], candidate["name"])), 1):
                 state = "SELECTED" if selected is candidate else "CREDIBLE" if candidate.get("_credible") else "REJECT"
                 print(f"GNS {candidate_index:<3}          | {state:<8} | {candidate['latitude']:>10.6f},{candidate['longitude']:>11.6f} | TYPE:{candidate['feature']:<8} | PR:{candidate.get('_priority', 99):<2} | MATCH:{candidate['match_mode']:<5} | NAME:{candidate['name'][:46]:<46} | ADM1:{candidate['adm1'] or '-':<12} | RANK:{candidate['rank']}")
 
@@ -913,6 +898,7 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
         WHERE latitude IS NULL OR longitude IS NULL
         ORDER BY country,region
     """).fetchall()
+
     remaining = [(country, region) for country, region, latitude, longitude, source in remaining_rows if not is_us(country) and str(source or "").upper() != "MANUAL"]
 
     db.close()
@@ -927,28 +913,30 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
     print(f"ALL REGIONS        | {len(all_gns_regions):>4}")
     print(f"ALREADY MATCHED    | {already_resolved:>4}")
     print(f"NEWLY MATCHED      | {stats['resolved']:>4}")
-    print(f"CLASSIFIED         | {stats['classified']:>4}")
+    print(f"EXACT              | {stats['exact']:>4}")
+    print(f"CLEAN              | {stats['clean']:>4}")
+    print(f"ALIAS              | {stats['alias']:>4}")
+    print(f"AMBIGUOUS          | {stats['ambiguous']:>4}")
     print(f"FAILED MATCH       | {failed_matches:>4}")
     print(f"METADATA FAILED    | {stats['metadata_failed']:>4}")
 
-    # > always show every unresolved non-US region regardless of diagnostics setting
     if remaining:
         print()
         print("UNRESOLVED NON-US REGIONS")
         for country, region in remaining: print(f"{country:<24} | {region}")
 
     return GNS_INDEX_DB_PATH
-GNS_INDEX_DB = prepare_gns_index_and_match_regions(print_diagnostics=False)
+GNS_INDEX_DB = prepare_gns_index_and_match_regions(print_diagnostics=True)
 
-# BUILD REUSABLE GNIS INDEX + MATCH US REGIONS | STATES -> CENSUS | OTHER US REGIONS -> GNIS
+# BUILD REUSABLE GNIS INDEX + SIMPLE US REGION ANCHOR MATCHING | STATES -> CENSUS | CITIES/OTHER -> GNIS
 GNIS_INDEX_DB_PATH = GEO_DIR / "gnis_index.db"
 GNIS_INDEX_VERSION = "1"
-GNIS_REGION_CLUSTER_KM = 50.0
+GNIS_AMBIGUITY_KM = 10.0
 GNIS_REGION_FEATURES = {
     "Populated Place", "Census", "Civil", "Island", "Park", "Reserve", "Locale", "Area",
     "Beach", "Bay", "Cape", "Harbor", "Lake", "Forest", "Range", "Valley"
 }
-def prepare_gnis_index_and_match_regions(print_diagnostics=False):
+def prepare_gnis_index_and_match_regions(print_diagnostics=True):
     import math
 
     norm = lambda v: " ".join(re.sub(r"\bsaint\b", "st", re.sub(r"[^a-z0-9]+", " ", "".join(c for c in unicodedata.normalize("NFKD", str(v or "")) if not unicodedata.combining(c)).casefold().replace("’", "").replace("'", ""))).split())
@@ -956,16 +944,12 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
     clean = lambda v: re.sub(r"\([^)]*\)", "", str(v or "")).strip(" ,-")
     is_us = lambda country: norm(country) in US_COUNTRY_NAMES
 
-    # > explicit supplier-region disambiguation where the name alone is genuinely ambiguous
     gnis_state_hints = {
         "las vegas":"Nevada",
         "new york":"New York"
     }
-
-    # > these names are intentionally treated as cities rather than same-named Census states
     force_gnis_regions = set(gnis_state_hints)
 
-    # > supplier-name variants only; no fuzzy guessing
     def region_variants(region):
         original = clean(region)
         variants = [(original, "EXACT")]
@@ -981,42 +965,16 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
         a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
         return 2 * r * math.asin(min(1.0, math.sqrt(a)))
 
-    def cluster_candidates(candidates):
-        groups = []
-        for candidate in candidates:
-            touching = []
-            for i, group in enumerate(groups):
-                if any(haversine_km(candidate["latitude"], candidate["longitude"], other["latitude"], other["longitude"]) <= GNIS_REGION_CLUSTER_KM for other in group): touching.append(i)
-            if not touching:
-                groups.append([candidate])
-                continue
-            merged = [candidate]
-            for i in reversed(touching): merged.extend(groups.pop(i))
-            groups.append(merged)
-
-        changed = True
-        while changed and len(groups) > 1:
-            changed = False
-            for i in range(len(groups)):
-                if changed: break
-                for j in range(i + 1, len(groups)):
-                    if any(haversine_km(a["latitude"], a["longitude"], b["latitude"], b["longitude"]) <= GNIS_REGION_CLUSTER_KM for a in groups[i] for b in groups[j]):
-                        groups[i].extend(groups[j])
-                        del groups[j]
-                        changed = True
-                        break
-        return groups
-
     def feature_priority(feature_class):
         priorities = {
             "Populated Place":0,
-            "Census":1,
             "Civil":1,
+            "Census":1,
             "Island":2,
-            "Park":3,
-            "Reserve":3,
+            "Area":3,
             "Locale":3,
-            "Area":4,
+            "Park":4,
+            "Reserve":4,
             "Beach":5,
             "Bay":5,
             "Cape":5,
@@ -1029,46 +987,39 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
         return priorities.get(str(feature_class or "").strip(), 99)
 
     def select_candidate(candidates):
-        credible = []
+        if not candidates: return None, "NO MATCH"
+
         for candidate in candidates:
             candidate["_priority"] = feature_priority(candidate["feature_class"])
             candidate["_credible"] = candidate["_priority"] < 99
-            if candidate["_credible"]: credible.append(candidate)
 
+        credible = [candidate for candidate in candidates if candidate["_credible"]]
         if not credible: return None, "NO CREDIBLE"
 
-        best_priority = min(x["_priority"] for x in credible)
-        top = [x for x in credible if x["_priority"] == best_priority]
-        groups = cluster_candidates(top)
+        best_match_mode = min(0 if candidate["match_mode"] == "EXACT" else 1 for candidate in credible)
+        credible = [candidate for candidate in credible if (0 if candidate["match_mode"] == "EXACT" else 1) == best_match_mode]
 
-        if len(groups) > 1: return None, f"AMBIGUOUS {len(groups)} CLUSTERS"
+        best_priority = min(candidate["_priority"] for candidate in credible)
+        top = [candidate for candidate in credible if candidate["_priority"] == best_priority]
+        top.sort(key=lambda candidate: (int(candidate["feature_id"]), candidate["name"], candidate["latitude"], candidate["longitude"]))
 
-        group = groups[0]
-        mode_priority = {"EXACT":0, "CLEAN":1}
+        selected = top[0]
 
-        if len(group) == 1: return group[0], group[0]["match_mode"]
+        materially_different = [
+            candidate for candidate in top[1:]
+            if haversine_km(selected["latitude"], selected["longitude"], candidate["latitude"], candidate["longitude"]) > GNIS_AMBIGUITY_KM
+        ]
 
-        def centrality(candidate):
-            return sum(haversine_km(candidate["latitude"], candidate["longitude"], other["latitude"], other["longitude"]) for other in group if other is not candidate)
+        if materially_different: return None, f"AMBIGUOUS {len(top)} SAME-PRIORITY LOCATIONS"
 
-        selected = min(group, key=lambda x: (mode_priority.get(x["match_mode"], 99), centrality(x), int(x["feature_id"])))
-        return selected, "CLUSTER"
+        return selected, selected["match_mode"]
 
-    # > classify provenance without making matching stricter
-    def coordinate_confidence(region, selected, source, selection_reason=None):
+    def coordinate_confidence(region, selected, source):
         if source == "CENSUS": return "TRUSTED"
+        if selected["match_mode"] == "CLEAN": return "HIGH"
+        if selected["feature_class"] in {"Populated Place", "Island", "Civil", "Census"}: return "TRUSTED"
+        return "HIGH"
 
-        match_mode = selected["match_mode"]
-        feature_class = str(selected.get("feature_class") or "").strip()
-        state_hint = gnis_state_hints.get(norm(region))
-
-        if match_mode == "CLEAN": return "HIGH"
-        if match_mode == "EXACT" and state_hint and feature_class == "Populated Place": return "TRUSTED"
-        if match_mode == "EXACT" and feature_class == "Island": return "TRUSTED"
-        if match_mode == "EXACT": return "HIGH"
-        return "REVIEW"
-
-    # > load official Census state representative coordinates
     census_states = {}
     with open(CENSUS_STATES_PATH, "r", encoding="utf-8-sig", errors="replace") as f:
         header_raw = f.readline().rstrip("\r\n")
@@ -1082,6 +1033,7 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
         for raw in f:
             parts = raw.rstrip("\r\n").split(delimiter)
             if len(parts) <= max(idx[x] for x in required): continue
+
             try:
                 name = parts[idx["name"]].strip()
                 census_states[norm(name)] = {
@@ -1094,7 +1046,6 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
             except (ValueError, TypeError):
                 continue
 
-    # > reusable GNIS index is tied only to the downloaded GNIS source
     source_signature = f"{GNIS_DOMESTIC_PATH.name}|{GNIS_DOMESTIC_PATH.stat().st_size}"
     index_valid = False
 
@@ -1209,7 +1160,6 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
         index_db.close()
         print(f"GNIS INDEX         | READY | {inserted:,} NAME ROWS")
 
-    # > missing US coordinates are matched; existing Census/GNIS rows missing provenance are classified without moving them
     db = sqlite3.connect(HOLIDAYS_DB_PATH)
     all_region_rows = db.execute("""
         SELECT country,region,latitude,longitude,coordinate_source,coordinate_match,coordinate_feature,coordinate_confidence
@@ -1237,7 +1187,7 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
     to_classify = len(us_regions) - to_match
     index_db = sqlite3.connect(GNIS_INDEX_DB_PATH)
 
-    stats = {"total":len(us_regions), "resolved":0, "classified":0, "census":0, "gnis":0, "exact":0, "clean":0, "cluster":0, "ambiguous":0, "no_match":0, "metadata_failed":0}
+    stats = {"total":len(us_regions), "resolved":0, "classified":0, "census":0, "gnis":0, "exact":0, "clean":0, "ambiguous":0, "no_match":0, "metadata_failed":0}
 
     print(f"US REGIONS         | {len(all_us_regions):,} TOTAL | {already_resolved:,} HAVE COORDS | {to_match:,} TO MATCH | {to_classify:,} TO CLASSIFY")
 
@@ -1290,12 +1240,12 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
                         "longitude":float(longitude),
                         "match_mode":match_mode
                     }
+
                     old = candidates_by_key.get(key)
                     if old is None or (0 if match_mode == "EXACT" else 1) < (0 if old["match_mode"] == "EXACT" else 1): candidates_by_key[key] = candidate
 
             return list(candidates_by_key.values())
 
-        # > existing Census provenance is recovered from the exact stored coordinate without moving it
         if classification_only and str(existing_source or "").upper() == "CENSUS":
             census_state = census_states.get(region_norm)
 
@@ -1316,7 +1266,6 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
                 reason = "EXISTING CENSUS COORD NOT FOUND"
                 stats["metadata_failed"] += 1
 
-        # > existing GNIS provenance is recovered from the matching GNIS feature at the exact stored coordinate
         elif classification_only and str(existing_source or "").upper() == "GNIS":
             candidates = lookup_gnis_candidates()
 
@@ -1332,7 +1281,7 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
                 ]
 
                 if existing_candidates:
-                    selected = min(existing_candidates, key=lambda x: (0 if x["match_mode"] == "EXACT" else 1, feature_priority(x["feature_class"]), int(x["feature_id"])))
+                    selected = min(existing_candidates, key=lambda candidate: (0 if candidate["match_mode"] == "EXACT" else 1, feature_priority(candidate["feature_class"]), int(candidate["feature_id"])))
                     selected["_priority"] = feature_priority(selected["feature_class"])
                     selected["_credible"] = selected["_priority"] < 99
                     reason = selection_reason
@@ -1342,7 +1291,6 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
                     stats["metadata_failed"] += 1
 
         else:
-            # > exact Census state-name match unless supplier semantics explicitly say this is a city
             census_state = census_states.get(region_norm)
 
             if census_state and region_norm not in force_gnis_regions:
@@ -1360,7 +1308,6 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
                 source = "CENSUS"
                 stats["resolved"] += 1
                 stats["census"] += 1
-
             else:
                 candidates = lookup_gnis_candidates()
 
@@ -1374,7 +1321,6 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
                         source = "GNIS"
                         stats["resolved"] += 1
                         stats["gnis"] += 1
-                        if reason == "CLUSTER": stats["cluster"] += 1
                         if selected["match_mode"] == "EXACT": stats["exact"] += 1
                         else: stats["clean"] += 1
                     elif reason.startswith("AMBIGUOUS"):
@@ -1383,7 +1329,7 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
                         stats["no_match"] += 1
 
         if selected:
-            confidence = coordinate_confidence(region, selected, source, reason)
+            confidence = coordinate_confidence(region, selected, source)
 
             if classification_only:
                 db.execute("""
@@ -1394,11 +1340,14 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
                       AND UPPER(COALESCE(coordinate_source,''))=?
                 """, (selected["match_mode"], selected["feature_class"], confidence, country, region, source))
                 stats["classified"] += 1
-                if source == "CENSUS": stats["census"] += 1
+
+                if source == "CENSUS":
+                    stats["census"] += 1
                 else:
                     stats["gnis"] += 1
                     if selected["match_mode"] == "EXACT": stats["exact"] += 1
                     else: stats["clean"] += 1
+
                 status = f"CLASSIFIED {source} {selected['match_mode']}"
             else:
                 db.execute("""
@@ -1409,10 +1358,7 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
                       AND UPPER(COALESCE(coordinate_source,'')) <> 'MANUAL'
                 """, (selected["latitude"], selected["longitude"], source, selected["match_mode"], selected["feature_class"], confidence, country, region))
 
-                if source == "CENSUS":
-                    status = "AUTO CENSUS STATE"
-                else:
-                    status = "AUTO CLUSTER" if reason == "CLUSTER" else f"AUTO {selected['match_mode']}"
+                status = "AUTO CENSUS STATE" if source == "CENSUS" else f"AUTO {selected['match_mode']}"
         else:
             confidence = None
             status = reason
@@ -1432,7 +1378,7 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
             else:
                 print("SELECTED           | NONE")
 
-            for candidate_index, candidate in enumerate(sorted(candidates, key=lambda x: (x.get("_priority", 99), 0 if x["match_mode"] == "EXACT" else 1, x["state_name"], x["name"])), 1):
+            for candidate_index, candidate in enumerate(sorted(candidates, key=lambda candidate: (0 if candidate["match_mode"] == "EXACT" else 1, candidate.get("_priority", 99), candidate["state_name"], candidate["name"])), 1):
                 state = "SELECTED" if selected is candidate else "CREDIBLE" if candidate.get("_credible") else "REJECT"
                 print(f"GNIS {candidate_index:<3}         | {state:<8} | {candidate['latitude']:>10.6f},{candidate['longitude']:>11.6f} | TYPE:{candidate['feature_class']:<16} | PR:{candidate.get('_priority', 99):<2} | MATCH:{candidate['match_mode']:<5} | NAME:{candidate['name'][:38]:<38} | STATE:{candidate['state_name'][:20] or '-':<20} | COUNTY:{candidate['county_name'][:24] or '-':<24} | ID:{candidate['feature_id']}")
 
@@ -1444,6 +1390,7 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
         WHERE latitude IS NULL OR longitude IS NULL
         ORDER BY country,region
     """).fetchall()
+
     remaining = [(country, region) for country, region, latitude, longitude, source in remaining_rows if is_us(country) and str(source or "").upper() != "MANUAL"]
 
     db.close()
@@ -1458,7 +1405,11 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
     print(f"ALL REGIONS        | {len(all_us_regions):>4}")
     print(f"ALREADY MATCHED    | {already_resolved:>4}")
     print(f"NEWLY MATCHED      | {stats['resolved']:>4}")
-    print(f"CLASSIFIED         | {stats['classified']:>4}")
+    print(f"CENSUS             | {stats['census']:>4}")
+    print(f"GNIS               | {stats['gnis']:>4}")
+    print(f"EXACT              | {stats['exact']:>4}")
+    print(f"CLEAN              | {stats['clean']:>4}")
+    print(f"AMBIGUOUS          | {stats['ambiguous']:>4}")
     print(f"FAILED MATCH       | {failed_matches:>4}")
     print(f"METADATA FAILED    | {stats['metadata_failed']:>4}")
 
@@ -1468,9 +1419,10 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=False):
         for country, region in remaining: print(f"{country:<24} | {region}")
 
     return GNIS_INDEX_DB_PATH
-GNIS_INDEX_DB = prepare_gnis_index_and_match_regions(print_diagnostics=False)
+GNIS_INDEX_DB = prepare_gnis_index_and_match_regions(print_diagnostics=True)
 
 # INSPECT ACCURACY OF REGIONAL COORDINATES
+show_debug_map = False
 import time
 import webbrowser
 OUTPUT_HTML = Path("region_coordinate_map.html")
