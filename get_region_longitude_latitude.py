@@ -23,7 +23,7 @@ import zipfile
 BASE_DIR = Path(__file__).resolve().parent
 HOLIDAYS_DB_PATH = BASE_DIR / "holidays.db"
 
-db = sqlite3.connect(HOLIDAYS_DB_PATH); db.execute("DROP TABLE IF EXISTS regions"); db.commit(); db.close()
+# db = sqlite3.connect(HOLIDAYS_DB_PATH); db.execute("DROP TABLE IF EXISTS regions"); db.commit(); db.close()
 
 # PREPARE GNS + GNIS + US CENSUS SOURCE DATA | GNS FILE AGE ALONE CONTROLS FULL REFRESH
 GEO_DIR = BASE_DIR / "GEO"
@@ -376,6 +376,7 @@ def sync_regions():
             latitude REAL,
             longitude REAL,
             coordinate_source TEXT,
+            coordinate_name TEXT,
             coordinate_match TEXT,
             coordinate_feature TEXT,
             coordinate_confidence TEXT,
@@ -848,21 +849,21 @@ def prepare_gns_index_and_match_regions(print_diagnostics=True):
             if classification_only:
                 db.execute("""
                     UPDATE regions
-                    SET coordinate_match=?,coordinate_feature=?,coordinate_confidence=?
+                    SET coordinate_name=?,coordinate_match=?,coordinate_feature=?,coordinate_confidence=?
                     WHERE country=? COLLATE NOCASE AND region=? COLLATE NOCASE
                       AND latitude IS NOT NULL AND longitude IS NOT NULL
                       AND UPPER(COALESCE(coordinate_source,''))='GNS'
-                """, (selected["match_mode"], selected["feature"], confidence, country, region))
+                """, (selected["name"], selected["match_mode"], selected["feature"], confidence, country, region))
                 stats["classified"] += 1
                 status = f"CLASSIFIED {selected['match_mode']}"
             else:
                 db.execute("""
                     UPDATE regions
-                    SET latitude=?,longitude=?,coordinate_source='GNS',coordinate_match=?,coordinate_feature=?,coordinate_confidence=?
+                    SET latitude=?,longitude=?,coordinate_source='GNS',coordinate_name=?,coordinate_match=?,coordinate_feature=?,coordinate_confidence=?
                     WHERE country=? COLLATE NOCASE AND region=? COLLATE NOCASE
                       AND (latitude IS NULL OR longitude IS NULL)
                       AND UPPER(COALESCE(coordinate_source,'')) <> 'MANUAL'
-                """, (selected["latitude"], selected["longitude"], selected["match_mode"], selected["feature"], confidence, country, region))
+                """, (selected["latitude"], selected["longitude"], selected["name"], selected["match_mode"], selected["feature"], confidence, country, region))
                 status = f"AUTO {selected['match_mode']}"
 
             if selected["match_mode"] == "EXACT": stats["exact"] += 1
@@ -1334,30 +1335,33 @@ def prepare_gnis_index_and_match_regions(print_diagnostics=True):
             if classification_only:
                 db.execute("""
                     UPDATE regions
-                    SET coordinate_match=?,coordinate_feature=?,coordinate_confidence=?
+                    SET coordinate_name=?,coordinate_match=?,coordinate_feature=?,coordinate_confidence=?
                     WHERE country=? COLLATE NOCASE AND region=? COLLATE NOCASE
                       AND latitude IS NOT NULL AND longitude IS NOT NULL
                       AND UPPER(COALESCE(coordinate_source,''))=?
-                """, (selected["match_mode"], selected["feature_class"], confidence, country, region, source))
+                """, (selected["name"], selected["match_mode"], selected["feature_class"], confidence, country, region,
+                      source))
                 stats["classified"] += 1
 
                 if source == "CENSUS":
                     stats["census"] += 1
                 else:
                     stats["gnis"] += 1
-                    if selected["match_mode"] == "EXACT": stats["exact"] += 1
-                    else: stats["clean"] += 1
+                    if selected["match_mode"] == "EXACT":
+                        stats["exact"] += 1
+                    else:
+                        stats["clean"] += 1
 
                 status = f"CLASSIFIED {source} {selected['match_mode']}"
             else:
                 db.execute("""
                     UPDATE regions
-                    SET latitude=?,longitude=?,coordinate_source=?,coordinate_match=?,coordinate_feature=?,coordinate_confidence=?
+                    SET latitude=?,longitude=?,coordinate_source=?,coordinate_name=?,coordinate_match=?,coordinate_feature=?,coordinate_confidence=?
                     WHERE country=? COLLATE NOCASE AND region=? COLLATE NOCASE
                       AND (latitude IS NULL OR longitude IS NULL)
                       AND UPPER(COALESCE(coordinate_source,'')) <> 'MANUAL'
-                """, (selected["latitude"], selected["longitude"], source, selected["match_mode"], selected["feature_class"], confidence, country, region))
-
+                """, (selected["latitude"], selected["longitude"], source, selected["name"], selected["match_mode"],
+                      selected["feature_class"], confidence, country, region))
                 status = "AUTO CENSUS STATE" if source == "CENSUS" else f"AUTO {selected['match_mode']}"
         else:
             confidence = None
