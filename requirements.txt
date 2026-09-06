@@ -1,0 +1,9 @@
+requests
+pandas
+numpy
+matplotlib
+duckdb
+mcp
+shapely
+py7zr
+
