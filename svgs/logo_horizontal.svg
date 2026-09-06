@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="525" height="110" viewBox="0 0 525 110" role="img" aria-label="Package Scout logo">
-  <rect width="100%" height="100%" fill="#ffffff"/>
+<!--  <rect width="100%" height="100%" fill="#ffffff"/>-->
 
   <!-- wordmark -->
   <text x="24" y="72" fill="#26303C" font-family="Inter, Avenir Next, Helvetica Neue, Arial, sans-serif" font-size="46">

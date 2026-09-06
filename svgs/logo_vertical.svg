@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="260" height="200" viewBox="0 0 260 200" role="img" aria-label="Package Scout logo">
-  <rect width="100%" height="100%" fill="#ffffff"/>
+<!--  <rect width="100%" height="100%" fill="#ffffff"/>-->
 
   <!-- icon -->
   <g transform="translate(35 15) scale(0.42)">
